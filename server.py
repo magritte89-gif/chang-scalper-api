@@ -21,7 +21,7 @@ def build_symbol(raw: str) -> str:
     digits = re.sub(r"[^0-9]", "", raw)
     if len(digits) < 6:
         return ""
-    # 뒤에서 6자리 사용 (예: 1234005930 -> 005930)
+    # 뒤에서 6자리 사용
     code = digits[-6:]
     return code
 
@@ -65,8 +65,8 @@ def fetch_ohlcv_naver(code: str, pages: int = 15) -> pd.DataFrame:
         res = requests.get(url, headers=headers, timeout=5)
         res.raise_for_status()
 
-        # 네이버 일별시세 테이블 파싱
-        tables = pd.read_html(res.text)
+        # ✅ lxml 대신 bs4(html5lib)를 사용
+        tables = pd.read_html(res.text, flavor="bs4")
         if not tables:
             continue
         df = tables[0].dropna()
@@ -393,7 +393,7 @@ def analyze():
 
 @app.route("/")
 def health():
-    return "Chang scalper API (Naver version) is running."
+    return "Chang scalper API (Naver + bs4 version) is running."
 
 
 if __name__ == "__main__":

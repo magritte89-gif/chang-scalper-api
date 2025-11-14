@@ -1,7 +1,7 @@
 flask
 flask-cors
-yfinance
 pandas
 numpy
-gunicorn
-flask-cors
+requests
+beautifulsoup4
+html5lib

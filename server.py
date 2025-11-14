@@ -79,7 +79,8 @@ def analyze():
 
     try:
         # 최근 3개월 일봉 데이터
-        data = yf.download(symbol, period="3mo", interval="1d", auto_adjust=False, progress=False)
+        data = yf.download(symbol, period="3mo", interval="1d",
+                           auto_adjust=False, progress=False)
     except Exception as e:
         return jsonify({"error": "download_failed", "message": str(e)}), 500
 

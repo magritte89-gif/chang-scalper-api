@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import yfinance as yf
+import requests
 import pandas as pd
 import numpy as np
 import re
@@ -11,22 +11,19 @@ CORS(app)  # 우리 HTML 앱에서 이 서버를 부를 수 있게 허용
 
 def build_symbol(raw: str) -> str:
     """
-    사용자가 입력한 심볼을 보고
-    - 숫자만 있으면 KRX(.KS)
-    - 이미 .KS/.KQ 있으면 그대로
-    - 나머지는 해외 종목 그대로 사용
+    코스피/코스닥 전용 심볼 변환
+    - 입력에서 숫자만 뽑아서 6자리 코드로 사용
+    - 예) "005930", "005930.KS", "삼성전자005930" -> "005930"
     """
-    t = raw.strip().upper()
-    if not t:
+    if not raw:
         return ""
-
-    if t.endswith(".KS") or t.endswith(".KQ"):
-        return t
-
-    if t.isdigit():
-        return t + ".KS"
-
-    return t  # 예: MSFT, AAPL 등
+    # 숫자만 추출
+    digits = re.sub(r"[^0-9]", "", raw)
+    if len(digits) < 6:
+        return ""
+    # 뒤에서 6자리 사용 (예: 1234005930 -> 005930)
+    code = digits[-6:]
+    return code
 
 
 def parse_capital(raw: str):
@@ -36,7 +33,6 @@ def parse_capital(raw: str):
     """
     if not raw:
         return None
-    # 숫자와 점만 남기고 제거
     cleaned = re.sub(r"[^0-9.]", "", raw)
     if not cleaned:
         return None
@@ -47,6 +43,72 @@ def parse_capital(raw: str):
         return value
     except ValueError:
         return None
+
+
+def fetch_ohlcv_naver(code: str, pages: int = 15) -> pd.DataFrame:
+    """
+    네이버 금융 일별 시세에서 OHLCV 데이터 가져오기
+    - 코스피/코스닥 6자리 코드 기준
+    - pages: 가져올 페이지 수 (1페이지 = 최대 10 거래일)
+    """
+    dfs = []
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        )
+    }
+
+    for page in range(1, pages + 1):
+        url = f"https://finance.naver.com/item/sise_day.nhn?code={code}&page={page}"
+        res = requests.get(url, headers=headers, timeout=5)
+        res.raise_for_status()
+
+        # 네이버 일별시세 테이블 파싱
+        tables = pd.read_html(res.text)
+        if not tables:
+            continue
+        df = tables[0].dropna()
+        if df.empty:
+            continue
+
+        # 컬럼 이름: 날짜 / 종가 / 전일비 / 시가 / 고가 / 저가 / 거래량
+        # 숫자형 컬럼 정리
+        for col in ["종가", "시가", "고가", "저가", "거래량"]:
+            df[col] = (
+                df[col]
+                .astype(str)
+                .str.replace(",", "", regex=False)
+            )
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        dfs.append(df)
+
+    if not dfs:
+        return pd.DataFrame()
+
+    data = pd.concat(dfs, ignore_index=True)
+    data = data.dropna(subset=["날짜", "종가", "거래량"])
+
+    # 날짜를 datetime으로 변환 후 오름차순 정렬
+    data["날짜"] = pd.to_datetime(data["날짜"])
+    data = data.sort_values("날짜")
+
+    # 컬럼명 통일
+    data = data.rename(
+        columns={
+            "날짜": "Date",
+            "종가": "Close",
+            "시가": "Open",
+            "고가": "High",
+            "저가": "Low",
+            "거래량": "Volume",
+        }
+    )
+    data = data.set_index("Date")
+
+    return data
 
 
 def calc_rsi(series: pd.Series, period: int = 14) -> float:
@@ -72,24 +134,49 @@ def analyze():
 
     symbol = build_symbol(raw_symbol)
     if not symbol:
-        return jsonify({"error": "invalid_symbol", "message": "심볼 형식이 잘못되었습니다."}), 400
+        return jsonify(
+            {
+                "error": "invalid_symbol",
+                "message": "코스피/코스닥 6자리 종목 코드를 확인해 주세요.",
+            }
+        ), 400
 
     capital_value = parse_capital(raw_capital)
     # None 이면 "자본 입력 안 함"으로 처리
 
+    # 네이버에서 데이터 가져오기
     try:
-        # 최근 3개월 일봉 데이터
-        data = yf.download(symbol, period="3mo", interval="1d",
-                           auto_adjust=False, progress=False)
+        data = fetch_ohlcv_naver(symbol, pages=15)
     except Exception as e:
-        return jsonify({"error": "download_failed", "message": str(e)}), 500
+        return (
+            jsonify(
+                {
+                    "error": "download_failed",
+                    "message": f"네이버 금융 데이터 조회 실패: {e}",
+                }
+            ),
+            500,
+        )
 
     if data is None or data.empty:
-        return jsonify({"error": "empty_data", "message": f"{symbol} 데이터가 없습니다."}), 404
+        return (
+            jsonify(
+                {
+                    "error": "empty_data",
+                    "message": f"{symbol} 데이터가 없습니다. (네이버 금융)",
+                }
+            ),
+            404,
+        )
 
-    data = data.dropna()
+    # 최소 20거래일은 있어야 20일선 계산 가능
     if len(data) < 20:
-        return jsonify({"error": "insufficient_data", "message": "20일선 계산에 필요한 데이터가 부족합니다."}), 400
+        return jsonify(
+            {
+                "error": "insufficient_data",
+                "message": "20일선 계산에 필요한 데이터가 부족합니다.",
+            }
+        ), 400
 
     closes = data["Close"]
     volumes = data["Volume"]
@@ -158,17 +245,14 @@ def analyze():
     pos1_shares = pos2_shares = pos3_shares = None
 
     if capital_value is not None and today_close > 0:
-        # 오늘 이 종목에 쓸 최대 금액: 자본의 10%
         risk_fraction = 0.10
         position_budget = capital_value * risk_fraction
 
-        # 총 매수 가능 주수
         shares_total = int(position_budget // today_close)
 
-        # 분할 비중 (표준형 B: 40 / 30 / 30)
         pos1_shares = int(shares_total * 0.4)
         pos2_shares = int(shares_total * 0.3)
-        pos3_shares = shares_total - pos1_shares - pos2_shares  # 나머지
+        pos3_shares = shares_total - pos1_shares - pos2_shares
 
         pos1_amount = pos1_shares * today_close
         pos2_amount = pos2_shares * today_close
@@ -309,7 +393,7 @@ def analyze():
 
 @app.route("/")
 def health():
-    return "Chang scalper API is running."
+    return "Chang scalper API (Naver version) is running."
 
 
 if __name__ == "__main__":

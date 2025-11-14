@@ -6,7 +6,18 @@ import numpy as np
 import re
 
 app = Flask(__name__)
-CORS(app)  # 우리 HTML 앱에서 이 서버를 부를 수 있게 허용
+# flask-cors 기본 + 아래 after_request 로 한 번 더 확실히 CORS 헤더 추가
+CORS(app)
+
+
+# ---- CORS 헤더 강제 추가 ----
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    return response
+# ------------------------------
 
 
 def build_symbol(raw: str) -> str:
@@ -17,11 +28,9 @@ def build_symbol(raw: str) -> str:
     """
     if not raw:
         return ""
-    # 숫자만 추출
     digits = re.sub(r"[^0-9]", "", raw)
     if len(digits) < 6:
         return ""
-    # 뒤에서 6자리 사용
     code = digits[-6:]
     return code
 
@@ -65,7 +74,7 @@ def fetch_ohlcv_naver(code: str, pages: int = 15) -> pd.DataFrame:
         res = requests.get(url, headers=headers, timeout=5)
         res.raise_for_status()
 
-        # ✅ lxml 대신 bs4(html5lib)를 사용
+        # bs4(html5lib) 사용 – lxml 필요 없음
         tables = pd.read_html(res.text, flavor="bs4")
         if not tables:
             continue
@@ -73,8 +82,6 @@ def fetch_ohlcv_naver(code: str, pages: int = 15) -> pd.DataFrame:
         if df.empty:
             continue
 
-        # 컬럼 이름: 날짜 / 종가 / 전일비 / 시가 / 고가 / 저가 / 거래량
-        # 숫자형 컬럼 정리
         for col in ["종가", "시가", "고가", "저가", "거래량"]:
             df[col] = (
                 df[col]
@@ -91,11 +98,9 @@ def fetch_ohlcv_naver(code: str, pages: int = 15) -> pd.DataFrame:
     data = pd.concat(dfs, ignore_index=True)
     data = data.dropna(subset=["날짜", "종가", "거래량"])
 
-    # 날짜를 datetime으로 변환 후 오름차순 정렬
     data["날짜"] = pd.to_datetime(data["날짜"])
     data = data.sort_values("날짜")
 
-    # 컬럼명 통일
     data = data.rename(
         columns={
             "날짜": "Date",
@@ -142,9 +147,7 @@ def analyze():
         ), 400
 
     capital_value = parse_capital(raw_capital)
-    # None 이면 "자본 입력 안 함"으로 처리
 
-    # 네이버에서 데이터 가져오기
     try:
         data = fetch_ohlcv_naver(symbol, pages=15)
     except Exception as e:
@@ -169,7 +172,6 @@ def analyze():
             404,
         )
 
-    # 최소 20거래일은 있어야 20일선 계산 가능
     if len(data) < 20:
         return jsonify(
             {
@@ -187,33 +189,27 @@ def analyze():
     vol_today = float(volumes.iloc[-1])
     vol_prev = float(volumes.iloc[-2])
 
-    # RSI (14)
     rsi = calc_rsi(closes)
 
-    # 단타 A 세트 기준 스코어
     score = 0
     reasons = []
 
-    # 1) 20일선 위
     if today_close > ma20:
         score += 1
         reasons.append("20일선 위 (안전)")
     else:
         reasons.append("20일선 아래 → 위험")
 
-    # 2) 5일선 > 20일선
     if ma5 > ma20:
         score += 1
         reasons.append("5일선이 20일선 상향 돌파")
 
-    # 3) 거래량 증가 (전일 대비 +50%)
     if vol_today > vol_prev * 1.5:
         score += 1
         reasons.append("거래량 증가 (전일 대비 +50% 이상)")
     else:
         reasons.append("거래량 평범 또는 감소")
 
-    # 4) RSI 건강 구간
     if 45 <= rsi <= 60:
         score += 1
         reasons.append("RSI 건강 구간 (45~60)")
@@ -222,7 +218,6 @@ def analyze():
     elif rsi < 30:
         reasons.append("RSI 과매도 (30 이하)")
 
-    # 시그널 텍스트
     if score >= 3:
         signal = "BUY_STRONG"
         signal_kor = "🟢 매수 유력"
@@ -233,12 +228,10 @@ def analyze():
         signal = "AVOID"
         signal_kor = "🔴 매수주의"
 
-    # --- 손절 / 익절 가격 계산 ---
-    stop_loss_price = round(today_close * 0.97)   # -3%
-    tp1_price = round(today_close * 1.05)         # +5%
-    tp2_price = round(today_close * 1.07)         # +7%
+    stop_loss_price = round(today_close * 0.97)
+    tp1_price = round(today_close * 1.05)
+    tp2_price = round(today_close * 1.07)
 
-    # --- 자본 기반 포지션 사이즈 계산 (표준형: 전체 자본의 10% 사용, 40/30/30 분할) ---
     position_budget = None
     shares_total = None
     pos1_amount = pos2_amount = pos3_amount = None
@@ -258,10 +251,8 @@ def analyze():
         pos2_amount = pos2_shares * today_close
         pos3_amount = pos3_shares * today_close
 
-    # --- Step-by-Step 전략 텍스트 생성 ---
     strategy_lines = []
 
-    # STEP 1. 오늘 이 종목을 볼 가치가 있는지
     strategy_lines.append("STEP 1. 오늘 이 종목을 볼 가치가 있을까?")
     if score >= 3:
         strategy_lines.append(" → 단타 A-세트 기준으로 '오늘 진입 후보'에 해당합니다.")
@@ -270,7 +261,6 @@ def analyze():
     else:
         strategy_lines.append(" → 추세/거래량/RSI 조건이 충분히 맞지 않아 오늘은 관망이 더 안전합니다.")
 
-    # STEP 2. 오늘의 추세 요약
     strategy_lines.append("")
     strategy_lines.append("STEP 2. 오늘의 추세 요약")
     trend_desc = []
@@ -298,7 +288,6 @@ def analyze():
 
     strategy_lines.extend(trend_desc)
 
-    # STEP 3. 오늘의 추천 행동
     strategy_lines.append("")
     strategy_lines.append("STEP 3. 오늘의 추천 행동")
     if score >= 3:
@@ -308,7 +297,6 @@ def analyze():
     else:
         strategy_lines.append(" → 오늘은 신규 매수보다는 관망을 추천합니다.")
 
-    # STEP 4~5. 매수 타점 & 투자 금액
     strategy_lines.append("")
     strategy_lines.append("STEP 4. 매수 타점 (예시)")
     strategy_lines.append(" · 1차 매수: 현재가 ~ 5일선 근처 가격대에서 분할 진입을 고려합니다.")
@@ -329,7 +317,6 @@ def analyze():
         strategy_lines.append(" · 자본 정보를 입력하지 않아 구체적인 금액/수량 계산은 생략되었습니다.")
         strategy_lines.append(" · 원한다면 화면의 '투자 가능한 총 자본(원)' 입력란에 자본을 입력하고 다시 조회해 주세요.")
 
-    # STEP 6~8. 손절/익절 및 보유 중 관리
     strategy_lines.append("")
     strategy_lines.append("STEP 6. 손절 기준 (예시)")
     strategy_lines.append(f" · 손절가: 현재가 대비 약 -3% 구간 (대략 {stop_loss_price:,.0f}원 부근)")
@@ -347,7 +334,6 @@ def analyze():
     strategy_lines.append(" · 5일선을 이탈하고 거래량이 증가하며 하락하는 경우, 방어적인 대응이 필요합니다.")
     strategy_lines.append(" · 20일선까지 깨지는 경우 중기 추세가 훼손될 수 있으므로, 대부분 정리를 검토합니다.")
 
-    # STEP 9~10. 청산 & 복기
     strategy_lines.append("")
     strategy_lines.append("STEP 9. 청산 시나리오")
     strategy_lines.append(" · 목표 수익(예: +5~7%) 구간에 도달했다면, 욕심을 과도하게 내지 말고 계획대로 청산합니다.")
@@ -393,7 +379,7 @@ def analyze():
 
 @app.route("/")
 def health():
-    return "Chang scalper API (Naver + bs4 version) is running."
+    return "Chang scalper API (Naver + bs4 + CORS) is running."
 
 
 if __name__ == "__main__":

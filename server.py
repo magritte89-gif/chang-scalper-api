@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timedelta
-import traceback
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
 import numpy as np
 import pandas as pd
@@ -11,21 +11,14 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-
-# -----------------------------
-# 공통 에러 응답
-# -----------------------------
-def error_response(message, status_code=500, **extra):
-    payload = {"error": True, "message": message}
-    payload.update(extra)
-    return jsonify(payload), status_code
+# yfinance 다운로드를 따로 돌리기 위한 스레드풀
+executor = ThreadPoolExecutor(max_workers=4)
 
 
 # -----------------------------
 # 유틸 함수들
 # -----------------------------
 def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """단순 RSI 계산"""
     delta = series.diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
@@ -39,10 +32,8 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def parse_capital(raw: str):
-    """'1,000,000' 같은 입력을 int로 변환. 실패 시 None"""
     if not raw:
         return None
-
     try:
         cleaned = raw.replace(",", "").strip()
         if not cleaned:
@@ -53,10 +44,6 @@ def parse_capital(raw: str):
 
 
 def make_position_plan(today_close: float, capital: int):
-    """
-    자본(capital)의 10%를 한 종목에 사용한다고 가정하고
-    40/30/30 3회 분할 매수 전략 계산.
-    """
     if capital is None or capital <= 0 or today_close <= 0:
         return {
             "capital_input": capital,
@@ -70,7 +57,7 @@ def make_position_plan(today_close: float, capital: int):
             "pos3_amount": 0,
         }
 
-    position_budget = int(capital * 0.10)  # 10%
+    position_budget = int(capital * 0.10)  # 자본 10%
     shares_total = position_budget // today_close
 
     if shares_total <= 0:
@@ -88,7 +75,7 @@ def make_position_plan(today_close: float, capital: int):
 
     pos1_shares = int(round(shares_total * 0.4))
     pos2_shares = int(round(shares_total * 0.3))
-    pos3_shares = int(shares_total - pos1_shares - pos2_shares)
+    pos3_shares = shares_total - pos1_shares - pos2_shares
 
     pos1_amount = int(pos1_shares * today_close)
     pos2_amount = int(pos2_shares * today_close)
@@ -108,7 +95,6 @@ def make_position_plan(today_close: float, capital: int):
 
 
 def build_signal(today_close, ma20, rsi, volume_today, volume_prev):
-    """간단한 룰 베이스로 시그널 / 이유 문장 생성"""
     reasons = []
     signal = "관망 구간"
 
@@ -124,10 +110,11 @@ def build_signal(today_close, ma20, rsi, volume_today, volume_prev):
         reasons.append("종가가 20일선 아래에 위치 (중기 하락 추세 가능)")
         reasons.append("RSI가 40 미만으로 약세 구간")
 
-    if volume_prev and volume_today > volume_prev * 1.5:
-        reasons.append("금일 거래량이 전일 대비 1.5배 이상 증가 (수급 주목)")
-    elif volume_prev and volume_today < volume_prev * 0.7:
-        reasons.append("금일 거래량이 전일 대비 감소 (관망 심리 확대 가능)")
+    if volume_prev:
+        if volume_today > volume_prev * 1.5:
+            reasons.append("금일 거래량이 전일 대비 1.5배 이상 증가 (수급 주목)")
+        elif volume_today < volume_prev * 0.7:
+            reasons.append("금일 거래량이 전일 대비 감소 (관망 심리 확대 가능)")
 
     if not reasons:
         reasons.append("특별히 강한 시그널은 없으며, 기본 관망/분할 대응 구간입니다.")
@@ -136,7 +123,6 @@ def build_signal(today_close, ma20, rsi, volume_today, volume_prev):
 
 
 def build_strategy_text(signal, today_close, stop_loss_price, tp1_price, tp2_price):
-    """화면에 보여 줄 '오늘의 시나리오' 문장"""
     base = f"""[오늘의 기본 시나리오]
 
 1) 진입 관점
@@ -158,6 +144,22 @@ def build_strategy_text(signal, today_close, stop_loss_price, tp1_price, tp2_pri
     return base
 
 
+def download_price_data(symbol_used: str):
+    """
+    yfinance 다운로드 함수 (스레드에서 실행)
+    너무 긴 기간 말고 6개월 정도만.
+    """
+    # period="6mo" 방식이 start/end 보다 덜 꼬이는 편
+    df = yf.download(
+        symbol_used,
+        period="6mo",
+        interval="1d",
+        progress=False,
+        threads=False,
+    )
+    return df
+
+
 # -----------------------------
 # Flask 라우트
 # -----------------------------
@@ -168,123 +170,118 @@ def health():
 
 @app.route("/analyze")
 def analyze():
+    symbol_input = request.args.get("symbol", "").strip()
+    capital_raw = request.args.get("capital", "").strip()
+
+    if not symbol_input:
+        return jsonify(
+            {"error": True, "message": "symbol 파라미터(종목 코드)가 필요합니다."}
+        ), 400
+
+    symbol_used = symbol_input
+    if symbol_input.isdigit() and len(symbol_input) == 6:
+        symbol_used = symbol_input + ".KS"
+
+    # ----- 가격 데이터 다운로드 (타임아웃 적용) -----
     try:
-        symbol_input = request.args.get("symbol", "").strip()
-        capital_raw = request.args.get("capital", "").strip()
-
-        if not symbol_input:
-            return error_response("symbol 파라미터(종목 코드)가 필요합니다.", 400)
-
-        # 한국 종목 코드이면 .KS 붙여서 yfinance 조회
-        symbol_used = symbol_input
-        if symbol_input.isdigit() and len(symbol_input) == 6:
-            symbol_used = symbol_input + ".KS"
-
-        # ---- 1) 데이터 다운로드 ----
-        try:
-            end = datetime.today()
-            start = end - timedelta(days=160)
-            df = yf.download(symbol_used, start=start, end=end)
-        except Exception as e:
-            return error_response(
-                f"데이터 다운로드 실패: {str(e)}", 500, symbol_used=symbol_used
-            )
-
-        if df is None or df.empty or len(df) < 40:
-            return error_response(
-                "가격 데이터가 부족합니다. 심볼/종목 코드를 다시 확인해 주세요.",
-                400,
-                symbol_used=symbol_used,
-            )
-
-        # ---- 2) 지표 계산 ----
-        df = df.rename(columns={"Close": "close", "Volume": "volume"})
-        if "close" not in df.columns or "volume" not in df.columns:
-            return error_response(
-                "필수 컬럼(close/volume)이 없습니다. 다른 종목으로 시도해 보세요.",
-                500,
-                symbol_used=symbol_used,
-                columns=list(df.columns),
-            )
-
-        df["ma5"] = df["close"].rolling(window=5).mean()
-        df["ma20"] = df["close"].rolling(window=20).mean()
-        df["rsi"] = calc_rsi(df["close"])
-
-        df = df.dropna()
-        if len(df) < 5:
-            return error_response(
-                "유효한 지표 계산을 위한 데이터가 부족합니다.",
-                400,
-                symbol_used=symbol_used,
-            )
-
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        today_close = float(last["close"])
-        ma5 = float(last["ma5"])
-        ma20 = float(last["ma20"])
-        rsi = float(last["rsi"])
-
-        volume_today = int(last["volume"])
-        volume_prev = int(prev["volume"]) if not pd.isna(prev["volume"]) else 0
-
-        stop_loss_price = today_close * 0.97  # -3%
-        tp1_price = today_close * 1.05        # +5%
-        tp2_price = today_close * 1.07        # +7%
-
-        # ---- 3) 시그널/전략 ----
-        signal_kor, reasons = build_signal(
-            today_close=today_close,
-            ma20=ma20,
-            rsi=rsi,
-            volume_today=volume_today,
-            volume_prev=volume_prev,
-        )
-
-        strategy_text = build_strategy_text(
-            signal=signal_kor,
-            today_close=today_close,
-            stop_loss_price=stop_loss_price,
-            tp1_price=tp1_price,
-            tp2_price=tp2_price,
-        )
-
-        # ---- 4) 자본/포지션 ----
-        capital = parse_capital(capital_raw)
-        position_info = make_position_plan(today_close=today_close, capital=capital)
-
-        # ---- 5) 최종 payload (딕셔너리만 사용, DataFrame X) ----
-        payload = {
-            "error": False,
-            "symbol_input": symbol_input,
-            "symbol_used": symbol_used,
-            "today_close": round(today_close),
-            "ma5": round(ma5),
-            "ma20": round(ma20),
-            "rsi": round(rsi, 1) if rsi == rsi else None,
-            "volume_today": int(volume_today),
-            "volume_prev": int(volume_prev),
-            "stop_loss_price": round(stop_loss_price),
-            "tp1_price": round(tp1_price),
-            "tp2_price": round(tp2_price),
-            "signal_kor": signal_kor,
-            "reasons": reasons,
-            "strategy_text": strategy_text,
-            **position_info,
-        }
-
-        return jsonify(payload)
-
+        future = executor.submit(download_price_data, symbol_used)
+        # 15초 안에 안 오면 Timeout
+        df = future.result(timeout=15)
+    except FuturesTimeout:
+        return jsonify(
+            {
+                "error": True,
+                "message": "야후에서 가격 데이터를 가져오는 데 시간이 너무 오래 걸립니다. 잠시 후 다시 시도해 주세요.",
+                "symbol_used": symbol_used,
+            }
+        ), 504
     except Exception as e:
-        # 예기치 못한 모든 에러도 JSON으로 반환
-        tb = traceback.format_exc()
-        print("UNEXPECTED ERROR in /analyze\n", tb, flush=True)
-        symbol_used = locals().get("symbol_used", None)
-        return error_response(
-            f"서버 내부 오류: {e}", 500, symbol_used=symbol_used, traceback=tb
-        )
+        return jsonify(
+            {
+                "error": True,
+                "message": f"데이터 다운로드 실패: {str(e)}",
+                "symbol_used": symbol_used,
+            }
+        ), 500
+
+    if df is None or df.empty or len(df) < 40:
+        return jsonify(
+            {
+                "error": True,
+                "message": "가격 데이터가 부족합니다. 심볼/종목 코드를 다시 확인해 주세요.",
+                "symbol_used": symbol_used,
+            }
+        ), 400
+
+    df = df.rename(columns={"Close": "close", "Volume": "volume"})
+    df["ma5"] = df["close"].rolling(window=5).mean()
+    df["ma20"] = df["close"].rolling(window=20).mean()
+    df["rsi"] = calc_rsi(df["close"])
+
+    df = df.dropna()
+    if len(df) < 5:
+        return jsonify(
+            {
+                "error": True,
+                "message": "유효한 지표 계산을 위한 데이터가 부족합니다.",
+                "symbol_used": symbol_used,
+            }
+        ), 400
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    today_close = float(last["close"])
+    ma5 = float(last["ma5"])
+    ma20 = float(last["ma20"])
+    rsi = float(last["rsi"])
+
+    volume_today = int(last["volume"])
+    volume_prev = int(prev["volume"]) if pd.notna(prev["volume"]) else 0
+
+    stop_loss_price = today_close * 0.97
+    tp1_price = today_close * 1.05
+    tp2_price = today_close * 1.07
+
+    signal_kor, reasons = build_signal(
+        today_close=today_close,
+        ma20=ma20,
+        rsi=rsi,
+        volume_today=volume_today,
+        volume_prev=volume_prev,
+    )
+
+    strategy_text = build_strategy_text(
+        signal=signal_kor,
+        today_close=today_close,
+        stop_loss_price=stop_loss_price,
+        tp1_price=tp1_price,
+        tp2_price=tp2_price,
+    )
+
+    capital = parse_capital(capital_raw)
+    position_info = make_position_plan(today_close=today_close, capital=capital)
+
+    payload = {
+        "error": False,
+        "symbol_input": symbol_input,
+        "symbol_used": symbol_used,
+        "today_close": round(today_close),
+        "ma5": round(ma5),
+        "ma20": round(ma20),
+        "rsi": round(rsi, 1),
+        "volume_today": int(volume_today),
+        "volume_prev": int(volume_prev),
+        "stop_loss_price": round(stop_loss_price),
+        "tp1_price": round(tp1_price),
+        "tp2_price": round(tp2_price),
+        "signal_kor": signal_kor,
+        "reasons": reasons,
+        "strategy_text": strategy_text,
+        **position_info,
+    }
+
+    return jsonify(payload)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import os
 from datetime import datetime, timedelta
+import traceback
 
 import numpy as np
 import pandas as pd
@@ -8,7 +9,16 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # 프론트(Render)에서 호출할 수 있도록 CORS 허용
+CORS(app)  # 프론트(Render)에서 호출 허용
+
+
+# -----------------------------
+# 공통 에러 응답 헬퍼
+# -----------------------------
+def error_response(message, status_code=500, **extra):
+    payload = {"error": True, "message": message}
+    payload.update(extra)
+    return jsonify(payload), status_code
 
 
 # -----------------------------
@@ -79,7 +89,7 @@ def make_position_plan(today_close: float, capital: int):
 
     pos1_shares = int(round(shares_total * 0.4))
     pos2_shares = int(round(shares_total * 0.3))
-    pos3_shares = shares_total - pos1_shares - pos2_shares
+    pos3_shares = int(shares_total - pos1_shares - pos2_shares)
 
     pos1_amount = int(pos1_shares * today_close)
     pos2_amount = int(pos2_shares * today_close)
@@ -165,128 +175,126 @@ def health():
 
 @app.route("/analyze")
 def analyze():
-    symbol_input = request.args.get("symbol", "").strip()
-    capital_raw = request.args.get("capital", "").strip()
-
-    if not symbol_input:
-        return (
-            jsonify({"error": True, "message": "symbol 파라미터(종목 코드)가 필요합니다."}),
-            400,
-        )
-
-    # 한국 종목 코드이면 .KS 붙여서 yfinance 조회
-    symbol_used = symbol_input
-    if symbol_input.isdigit() and len(symbol_input) == 6:
-        # 기본은 코스피(.KS)로 처리. 필요하면 .KQ로 변경 가능.
-        symbol_used = symbol_input + ".KS"
-
-    # 데이터 다운로드
     try:
-        end = datetime.today()
-        start = end - timedelta(days=160)
-        df = yf.download(symbol_used, start=start, end=end)
+        symbol_input = request.args.get("symbol", "").strip()
+        capital_raw = request.args.get("capital", "").strip()
+
+        if not symbol_input:
+            return error_response("symbol 파라미터(종목 코드)가 필요합니다.", 400)
+
+        # 한국 종목 코드이면 .KS 붙여서 yfinance 조회
+        symbol_used = symbol_input
+        if symbol_input.isdigit() and len(symbol_input) == 6:
+            symbol_used = symbol_input + ".KS"
+
+        # 데이터 다운로드
+        try:
+            end = datetime.today()
+            start = end - timedelta(days=160)
+            df = yf.download(symbol_used, start=start, end=end)
+        except Exception as e:
+            # yfinance 내부 에러
+            return error_response(
+                f"데이터 다운로드 실패: {str(e)}", 500, symbol_used=symbol_used
+            )
+
+        if df is None or df.empty or len(df) < 40:
+            return error_response(
+                "가격 데이터가 부족합니다. 심볼/종목 코드를 다시 확인해 주세요.",
+                400,
+                symbol_used=symbol_used,
+            )
+
+        # 컬럼 정리
+        df = df.rename(columns={"Close": "close", "Volume": "volume"})
+        if "close" not in df.columns or "volume" not in df.columns:
+            return error_response(
+                "필수 컬럼(close/volume)이 없습니다. 다른 종목으로 시도해 보세요.",
+                500,
+                symbol_used=symbol_used,
+                columns=list(df.columns),
+            )
+
+        df["ma5"] = df["close"].rolling(window=5).mean()
+        df["ma20"] = df["close"].rolling(window=20).mean()
+        df["rsi"] = calc_rsi(df["close"])
+
+        df = df.dropna()
+        if len(df) < 5:
+            return error_response(
+                "유효한 지표 계산을 위한 데이터가 부족합니다.",
+                400,
+                symbol_used=symbol_used,
+            )
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        today_close = float(last["close"])
+        ma5 = float(last["ma5"])
+        ma20 = float(last["ma20"])
+        rsi = float(last["rsi"])
+
+        volume_today = int(last["volume"])
+        volume_prev = int(prev["volume"]) if not pd.isna(prev["volume"]) else 0
+
+        stop_loss_price = today_close * 0.97  # -3%
+        tp1_price = today_close * 1.05        # +5%
+        tp2_price = today_close * 1.07        # +7%
+
+        # 시그널 / 이유
+        signal_kor, reasons = build_signal(
+            today_close=today_close,
+            ma20=ma20,
+            rsi=rsi,
+            volume_today=volume_today,
+            volume_prev=volume_prev,
+        )
+
+        # 전략 텍스트
+        strategy_text = build_strategy_text(
+            signal=signal_kor,
+            today_close=today_close,
+            stop_loss_price=stop_loss_price,
+            tp1_price=tp1_price,
+            tp2_price=tp2_price,
+        )
+
+        # 자본/포지션 사이징
+        capital = parse_capital(capital_raw)
+        position_info = make_position_plan(today_close=today_close, capital=capital)
+
+        payload = {
+            "error": False,
+            "symbol_input": symbol_input,
+            "symbol_used": symbol_used,
+            "today_close": round(today_close),
+            "ma5": round(ma5),
+            "ma20": round(ma20),
+            "rsi": round(rsi, 1) if rsi == rsi else None,  # NaN 방지
+            "volume_today": int(volume_today),
+            "volume_prev": int(volume_prev),
+            "stop_loss_price": round(stop_loss_price),
+            "tp1_price": round(tp1_price),
+            "tp2_price": round(tp2_price),
+            "signal_kor": signal_kor,
+            "reasons": reasons,
+            "strategy_text": strategy_text,
+            **position_info,
+        }
+
+        return jsonify(payload)
+
     except Exception as e:
-        return (
-            jsonify(
-                {
-                    "error": True,
-                    "message": f"데이터 다운로드 실패: {str(e)}",
-                    "symbol_used": symbol_used,
-                }
-            ),
-            500,
+        # 예기치 못한 모든 에러 캐치 → JSON으로 반환
+        tb = traceback.format_exc()
+        print("UNEXPECTED ERROR in /analyze\n", tb, flush=True)
+        symbol_used = locals().get("symbol_used", None)
+        return error_response(
+            f"서버 내부 오류: {e}", 500, symbol_used=symbol_used, traceback=tb
         )
-
-    if df is None or df.empty or len(df) < 40:
-        return (
-            jsonify(
-                {
-                    "error": True,
-                    "message": "가격 데이터가 부족합니다. 심볼/종목 코드를 다시 확인해 주세요.",
-                    "symbol_used": symbol_used,
-                }
-            ),
-            400,
-        )
-
-    df = df.rename(columns={"Close": "close", "Volume": "volume"})
-    df["ma5"] = df["close"].rolling(window=5).mean()
-    df["ma20"] = df["close"].rolling(window=20).mean()
-    df["rsi"] = calc_rsi(df["close"])
-
-    df = df.dropna()
-    if len(df) < 5:
-        return (
-            jsonify(
-                {
-                    "error": True,
-                    "message": "유효한 지표 계산을 위한 데이터가 부족합니다.",
-                    "symbol_used": symbol_used,
-                }
-            ),
-            400,
-        )
-
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    today_close = float(last["close"])
-    ma5 = float(last["ma5"])
-    ma20 = float(last["ma20"])
-    rsi = float(last["rsi"])
-
-    volume_today = int(last["volume"])
-    volume_prev = int(prev["volume"]) if prev["volume"] == prev["volume"] else 0  # NaN 방지
-
-    stop_loss_price = today_close * 0.97  # -3%
-    tp1_price = today_close * 1.05  # +5%
-    tp2_price = today_close * 1.07  # +7%
-
-    # 시그널 / 이유
-    signal_kor, reasons = build_signal(
-        today_close=today_close,
-        ma20=ma20,
-        rsi=rsi,
-        volume_today=volume_today,
-        volume_prev=volume_prev,
-    )
-
-    # 전략 텍스트
-    strategy_text = build_strategy_text(
-        signal=signal_kor,
-        today_close=today_close,
-        stop_loss_price=stop_loss_price,
-        tp1_price=tp1_price,
-        tp2_price=tp2_price,
-    )
-
-    # 자본/포지션 사이징
-    capital = parse_capital(capital_raw)
-    position_info = make_position_plan(today_close=today_close, capital=capital)
-
-    payload = {
-        "error": False,
-        "symbol_input": symbol_input,
-        "symbol_used": symbol_used,
-        "today_close": round(today_close),
-        "ma5": round(ma5),
-        "ma20": round(ma20),
-        "rsi": round(rsi, 1),
-        "volume_today": int(volume_today),
-        "volume_prev": int(volume_prev),
-        "stop_loss_price": round(stop_loss_price),
-        "tp1_price": round(tp1_price),
-        "tp2_price": round(tp2_price),
-        "signal_kor": signal_kor,
-        "reasons": reasons,
-        "strategy_text": strategy_text,
-        **position_info,
-    }
-
-    return jsonify(payload)
 
 
 if __name__ == "__main__":
-    # Render에서 PORT 환경변수를 사용하므로 이렇게 설정
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)

@@ -9,7 +9,8 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)
+# CORS 전체 허용 (프론트 Render 사이트에서 호출할 수 있게)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 
 # -----------------------------
@@ -22,36 +23,10 @@ def error_response(message, status_code=500, **extra):
 
 
 # -----------------------------
-# 안전한 스칼라 변환 헬퍼
-# -----------------------------
-def safe_scalar(x, default=0.0):
-    """
-    pandas Series, numpy 배열, 리스트 등 어떤 값이 들어와도
-    숫자 하나(float)로 바꿔 주는 함수.
-    문제가 생기면 default 값 반환.
-    """
-    try:
-        if isinstance(x, pd.Series):
-            if x.empty:
-                return default
-            x = x.iloc[-1]
-        elif isinstance(x, (np.ndarray, list, tuple)):
-            if len(x) == 0:
-                return default
-            x = x[-1]
-
-        if pd.isna(x):
-            return default
-
-        return float(x)
-    except Exception:
-        return default
-
-
-# -----------------------------
 # 유틸 함수들
 # -----------------------------
 def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """단순 RSI 계산"""
     delta = series.diff()
 
     up = delta.clip(lower=0)
@@ -66,6 +41,7 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def parse_capital(raw: str):
+    """'1,000,000' 같은 입력을 int로 변환. 실패 시 None"""
     if not raw:
         return None
 
@@ -79,6 +55,10 @@ def parse_capital(raw: str):
 
 
 def make_position_plan(today_close: float, capital: int):
+    """
+    자본(capital)의 10%를 한 종목에 사용한다고 가정하고
+    40/30/30 3회 분할 매수 전략 계산.
+    """
     if capital is None or capital <= 0 or today_close <= 0:
         return {
             "capital_input": capital,
@@ -93,7 +73,7 @@ def make_position_plan(today_close: float, capital: int):
         }
 
     position_budget = int(capital * 0.10)  # 10%
-    shares_total = int(position_budget // today_close)
+    shares_total = position_budget // today_close
 
     if shares_total <= 0:
         return {
@@ -110,7 +90,7 @@ def make_position_plan(today_close: float, capital: int):
 
     pos1_shares = int(round(shares_total * 0.4))
     pos2_shares = int(round(shares_total * 0.3))
-    pos3_shares = shares_total - pos1_shares - pos2_shares
+    pos3_shares = int(shares_total - pos1_shares - pos2_shares)
 
     pos1_amount = int(pos1_shares * today_close)
     pos2_amount = int(pos2_shares * today_close)
@@ -119,30 +99,25 @@ def make_position_plan(today_close: float, capital: int):
     return {
         "capital_input": capital,
         "position_budget": position_budget,
-        "shares_total": shares_total,
-        "pos1_shares": pos1_shares,
-        "pos2_shares": pos2_shares,
-        "pos3_shares": pos3_shares,
-        "pos1_amount": pos1_amount,
-        "pos2_amount": pos2_amount,
-        "pos3_amount": pos3_amount,
+        "shares_total": int(shares_total),
+        "pos1_shares": int(pos1_shares),
+        "pos2_shares": int(pos2_shares),
+        "pos3_shares": int(pos3_shares),
+        "pos1_amount": int(pos1_amount),
+        "pos2_amount": int(pos2_amount),
+        "pos3_amount": int(pos3_amount),
     }
 
 
 def build_signal(today_close, ma20, rsi, volume_today, volume_prev):
     """
-    간단한 룰 베이스로 시그널 / 이유 생성
+    간단한 룰 베이스로 시그널 / 이유 문장 생성 (전부 숫자 스칼라만 사용)
     """
-    today_close = safe_scalar(today_close, 0.0)
-    ma20 = safe_scalar(ma20, 0.0)
-    rsi = safe_scalar(rsi, 0.0)
-    volume_today = safe_scalar(volume_today, 0.0)
-    volume_prev = safe_scalar(volume_prev, 0.0)
-
     reasons = []
     signal = "관망 구간"
 
-    if today_close > 0 and ma20 > 0 and today_close > ma20 and 30 < rsi < 65:
+    # 이동평균/RSI 조합 예시
+    if today_close > ma20 and 30 < rsi < 65:
         signal = "우상향 눌림목 매수 관심"
         reasons.append("종가가 20일선 위에 위치 (중기 추세 우상향)")
         reasons.append("RSI가 30~65 구간으로 과열/과매도 아님")
@@ -154,6 +129,7 @@ def build_signal(today_close, ma20, rsi, volume_today, volume_prev):
         reasons.append("종가가 20일선 아래에 위치 (중기 하락 추세 가능)")
         reasons.append("RSI가 40 미만으로 약세 구간")
 
+    # 거래량 체크 (volume_prev가 0보다 클 때만 사용)
     if volume_prev > 0 and volume_today > volume_prev * 1.5:
         reasons.append("금일 거래량이 전일 대비 1.5배 이상 증가 (수급 주목)")
     elif volume_prev > 0 and volume_today < volume_prev * 0.7:
@@ -166,6 +142,9 @@ def build_signal(today_close, ma20, rsi, volume_today, volume_prev):
 
 
 def build_strategy_text(signal, today_close, stop_loss_price, tp1_price, tp2_price):
+    """
+    화면에 보여 줄 '오늘의 시나리오' 문장
+    """
     base = f"""[오늘의 기본 시나리오]
 
 1) 진입 관점
@@ -204,65 +183,92 @@ def analyze():
         if not symbol_input:
             return error_response("symbol 파라미터(종목 코드)가 필요합니다.", 400)
 
+        # 한국 종목 코드이면 .KS 붙여서 yfinance 조회
         symbol_used = symbol_input
         if symbol_input.isdigit() and len(symbol_input) == 6:
             symbol_used = symbol_input + ".KS"
 
+        # -------- 1) 데이터 다운로드 --------
         try:
-            end = datetime.today()
-            start = end - timedelta(days=160)
-            df = yf.download(symbol_used, start=start, end=end)
+            # 6개월 일봉만 단순 조회
+            df_raw = yf.download(
+                symbol_used,
+                period="6mo",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+            )
         except Exception as e:
             return error_response(
                 f"데이터 다운로드 실패: {str(e)}", 500, symbol_used=symbol_used
             )
 
-        if df is None or df.empty or len(df) < 40:
+        if df_raw is None or df_raw.empty:
             return error_response(
-                "가격 데이터가 부족합니다. 심볼/종목 코드를 다시 확인해 주세요.",
+                "가격 데이터가 없습니다. 심볼/종목 코드를 다시 확인해 주세요.",
                 400,
                 symbol_used=symbol_used,
             )
 
-        df = df.rename(columns={"Close": "close", "Volume": "volume"})
-        if "close" not in df.columns or "volume" not in df.columns:
+        # -------- 2) 지표 계산용 DataFrame 정리 --------
+        # 필요한 컬럼만 사용하고, 이름을 고정시킨 새 DF를 만든다 (Series 모호성 제거)
+        try:
+            close = df_raw["Close"].astype(float)
+            volume = df_raw["Volume"].fillna(0).astype(float)
+        except KeyError:
             return error_response(
-                "필수 컬럼(close/volume)이 없습니다. 다른 종목으로 시도해 보세요.",
+                "다운로드된 데이터에 Close/Volume 컬럼이 없습니다.",
                 500,
                 symbol_used=symbol_used,
-                columns=list(df.columns),
+                columns=list(df_raw.columns),
             )
 
-        df["ma5"] = df["close"].rolling(window=5).mean()
-        df["ma20"] = df["close"].rolling(window=20).mean()
-        df["rsi"] = calc_rsi(df["close"])
+        ma5 = close.rolling(window=5, min_periods=5).mean()
+        ma20 = close.rolling(window=20, min_periods=20).mean()
+        rsi_series = calc_rsi(close)
 
-        df = df.dropna()
-        if len(df) < 5:
+        df = pd.DataFrame(
+            {
+                "close": close,
+                "volume": volume,
+                "ma5": ma5,
+                "ma20": ma20,
+                "rsi": rsi_series,
+            }
+        ).dropna()
+
+        # 최근 데이터만 120개 정도만 사용
+        if len(df) > 120:
+            df = df.iloc[-120:]
+
+        if df.shape[0] < 30:
             return error_response(
                 "유효한 지표 계산을 위한 데이터가 부족합니다.",
                 400,
                 symbol_used=symbol_used,
             )
 
+        # -------- 3) 마지막 캔들값 뽑기 (전부 숫자 스칼라) --------
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
-        today_close = safe_scalar(last["close"], 0.0)
-        ma5 = safe_scalar(last["ma5"], 0.0)
-        ma20 = safe_scalar(last["ma20"], 0.0)
-        rsi = safe_scalar(last["rsi"], 0.0)
-        volume_today = safe_scalar(last["volume"], 0.0)
-        volume_prev = safe_scalar(prev["volume"], 0.0)
+        today_close = float(last["close"])
+        ma5_val = float(last["ma5"])
+        ma20_val = float(last["ma20"])
+        rsi_val = float(last["rsi"])
 
-        stop_loss_price = today_close * 0.97
-        tp1_price = today_close * 1.05
-        tp2_price = today_close * 1.07
+        volume_today = float(last["volume"])
+        volume_prev = float(prev["volume"])
+
+        # -------- 4) 손절/익절, 시그널, 전략 텍스트 --------
+        stop_loss_price = today_close * 0.97  # -3%
+        tp1_price = today_close * 1.05        # +5%
+        tp2_price = today_close * 1.07        # +7%
 
         signal_kor, reasons = build_signal(
             today_close=today_close,
-            ma20=ma20,
-            rsi=rsi,
+            ma20=ma20_val,
+            rsi=rsi_val,
             volume_today=volume_today,
             volume_prev=volume_prev,
         )
@@ -275,6 +281,7 @@ def analyze():
             tp2_price=tp2_price,
         )
 
+        # -------- 5) 자본/포지션 사이징 --------
         capital = parse_capital(capital_raw)
         position_info = make_position_plan(today_close=today_close, capital=capital)
 
@@ -283,9 +290,9 @@ def analyze():
             "symbol_input": symbol_input,
             "symbol_used": symbol_used,
             "today_close": round(today_close),
-            "ma5": round(ma5),
-            "ma20": round(ma20),
-            "rsi": round(rsi, 1) if rsi == rsi else None,
+            "ma5": round(ma5_val),
+            "ma20": round(ma20_val),
+            "rsi": round(rsi_val, 1),
             "volume_today": int(volume_today),
             "volume_prev": int(volume_prev),
             "stop_loss_price": round(stop_loss_price),
@@ -300,11 +307,12 @@ def analyze():
         return jsonify(payload)
 
     except Exception as e:
+        # 예기치 못한 모든 에러 캐치 → JSON으로 반환 (디버깅용 traceback 포함)
         tb = traceback.format_exc()
         print("UNEXPECTED ERROR in /analyze\n", tb, flush=True)
         symbol_used = locals().get("symbol_used", None)
         return error_response(
-            f"서버 내부 오류: {e}", 500, symbol_used=symbol_used
+            f"서버 내부 오류: {e}", 500, symbol_used=symbol_used, traceback=tb
         )
 
 

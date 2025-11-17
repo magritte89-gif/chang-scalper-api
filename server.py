@@ -1,386 +1,292 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import requests
-import pandas as pd
+import os
+from datetime import datetime, timedelta
+
 import numpy as np
-import re
+import pandas as pd
+import yfinance as yf
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 
 app = Flask(__name__)
-# flask-cors 기본 + 아래 after_request 로 한 번 더 확실히 CORS 헤더 추가
-CORS(app)
+CORS(app)  # 프론트(Render)에서 호출할 수 있도록 CORS 허용
 
 
-# ---- CORS 헤더 강제 추가 ----
-@app.after_request
-def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-    return response
-# ------------------------------
+# -----------------------------
+# 유틸 함수들
+# -----------------------------
+def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """단순 RSI 계산"""
+    delta = series.diff()
 
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
 
-def build_symbol(raw: str) -> str:
-    """
-    코스피/코스닥 전용 심볼 변환
-    - 입력에서 숫자만 뽑아서 6자리 코드로 사용
-    - 예) "005930", "005930.KS", "삼성전자005930" -> "005930"
-    """
-    if not raw:
-        return ""
-    digits = re.sub(r"[^0-9]", "", raw)
-    if len(digits) < 6:
-        return ""
-    code = digits[-6:]
-    return code
+    ma_up = up.rolling(window=period, min_periods=period).mean()
+    ma_down = down.rolling(window=period, min_periods=period).mean()
+
+    rs = ma_up / ma_down
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 
 def parse_capital(raw: str):
-    """
-    사용자가 입력한 자본 문자열을 숫자로 변환
-    예: "10,000,000" -> 10000000
-    """
+    """'1,000,000' 같은 입력을 int로 변환. 실패 시 None"""
     if not raw:
         return None
-    cleaned = re.sub(r"[^0-9.]", "", raw)
-    if not cleaned:
-        return None
+
     try:
-        value = float(cleaned)
-        if value <= 0:
+        cleaned = raw.replace(",", "").strip()
+        if not cleaned:
             return None
-        return value
-    except ValueError:
+        return int(float(cleaned))
+    except Exception:
         return None
 
 
-def fetch_ohlcv_naver(code: str, pages: int = 15) -> pd.DataFrame:
+def make_position_plan(today_close: float, capital: int):
     """
-    네이버 금융 일별 시세에서 OHLCV 데이터 가져오기
-    - 코스피/코스닥 6자리 코드 기준
-    - pages: 가져올 페이지 수 (1페이지 = 최대 10 거래일)
+    자본(capital)의 10%를 한 종목에 사용한다고 가정하고
+    40/30/30 3회 분할 매수 전략 계산.
     """
-    dfs = []
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36"
-        )
+    if capital is None or capital <= 0 or today_close <= 0:
+        return {
+            "capital_input": capital,
+            "position_budget": 0,
+            "shares_total": 0,
+            "pos1_shares": 0,
+            "pos2_shares": 0,
+            "pos3_shares": 0,
+            "pos1_amount": 0,
+            "pos2_amount": 0,
+            "pos3_amount": 0,
+        }
+
+    position_budget = int(capital * 0.10)  # 10%
+    shares_total = position_budget // today_close
+
+    if shares_total <= 0:
+        return {
+            "capital_input": capital,
+            "position_budget": position_budget,
+            "shares_total": 0,
+            "pos1_shares": 0,
+            "pos2_shares": 0,
+            "pos3_shares": 0,
+            "pos1_amount": 0,
+            "pos2_amount": 0,
+            "pos3_amount": 0,
+        }
+
+    pos1_shares = int(round(shares_total * 0.4))
+    pos2_shares = int(round(shares_total * 0.3))
+    pos3_shares = shares_total - pos1_shares - pos2_shares
+
+    pos1_amount = int(pos1_shares * today_close)
+    pos2_amount = int(pos2_shares * today_close)
+    pos3_amount = int(pos3_shares * today_close)
+
+    return {
+        "capital_input": capital,
+        "position_budget": position_budget,
+        "shares_total": int(shares_total),
+        "pos1_shares": int(pos1_shares),
+        "pos2_shares": int(pos2_shares),
+        "pos3_shares": int(pos3_shares),
+        "pos1_amount": int(pos1_amount),
+        "pos2_amount": int(pos2_amount),
+        "pos3_amount": int(pos3_amount),
     }
 
-    for page in range(1, pages + 1):
-        url = f"https://finance.naver.com/item/sise_day.nhn?code={code}&page={page}"
-        res = requests.get(url, headers=headers, timeout=5)
-        res.raise_for_status()
 
-        # bs4(html5lib) 사용 – lxml 필요 없음
-        tables = pd.read_html(res.text, flavor="bs4")
-        if not tables:
-            continue
-        df = tables[0].dropna()
-        if df.empty:
-            continue
+def build_signal(today_close, ma20, rsi, volume_today, volume_prev):
+    """
+    간단한 룰 베이스로 시그널 / 이유 문장 생성
+    """
+    reasons = []
+    signal = "관망 구간"
 
-        for col in ["종가", "시가", "고가", "저가", "거래량"]:
-            df[col] = (
-                df[col]
-                .astype(str)
-                .str.replace(",", "", regex=False)
-            )
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # 이동평균/RSI 조합 예시
+    if today_close > ma20 and 30 < rsi < 65:
+        signal = "우상향 눌림목 매수 관심"
+        reasons.append("종가가 20일선 위에 위치 (중기 추세 우상향)")
+        reasons.append("RSI가 30~65 구간으로 과열/과매도 아님")
+    elif rsi >= 70:
+        signal = "단기 과열 – 분할 청산/관망"
+        reasons.append("RSI가 70 이상으로 단기 과열 구간")
+    elif today_close < ma20 and rsi < 40:
+        signal = "하락 추세 – 무리한 진입 자제"
+        reasons.append("종가가 20일선 아래에 위치 (중기 하락 추세 가능)")
+        reasons.append("RSI가 40 미만으로 약세 구간")
 
-        dfs.append(df)
+    # 거래량 체크
+    if volume_prev and volume_today > volume_prev * 1.5:
+        reasons.append("금일 거래량이 전일 대비 1.5배 이상 증가 (수급 주목)")
+    elif volume_prev and volume_today < volume_prev * 0.7:
+        reasons.append("금일 거래량이 전일 대비 감소 (관망 심리 확대 가능)")
 
-    if not dfs:
-        return pd.DataFrame()
+    if not reasons:
+        reasons.append("특별히 강한 시그널은 없으며, 기본 관망/분할 대응 구간입니다.")
 
-    data = pd.concat(dfs, ignore_index=True)
-    data = data.dropna(subset=["날짜", "종가", "거래량"])
-
-    data["날짜"] = pd.to_datetime(data["날짜"])
-    data = data.sort_values("날짜")
-
-    data = data.rename(
-        columns={
-            "날짜": "Date",
-            "종가": "Close",
-            "시가": "Open",
-            "고가": "High",
-            "저가": "Low",
-            "거래량": "Volume",
-        }
-    )
-    data = data.set_index("Date")
-
-    return data
+    return signal, reasons
 
 
-def calc_rsi(series: pd.Series, period: int = 14) -> float:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+def build_strategy_text(signal, today_close, stop_loss_price, tp1_price, tp2_price):
+    """
+    화면에 보여 줄 '오늘의 시나리오' 문장
+    """
+    base = f"""[오늘의 기본 시나리오]
 
-    avg_gain = gain.rolling(window=period, min_periods=period).mean()
-    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+1) 진입 관점
+- 현재가: 약 {round(today_close)}원 기준
+- 시그널: {signal}
 
-    rs = avg_gain / (avg_loss.replace(0, np.nan))
-    rsi = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1])
+2) 손절/익절 기준 (예시)
+- 손절: 약 {round(stop_loss_price)}원 (현재가 기준 -3% 부근)
+- 1차 익절: 약 {round(tp1_price)}원 (현재가 기준 +5% 부근)
+- 2차 익절: 약 {round(tp2_price)}원 (현재가 기준 +7% 부근)
+
+3) 운용 팁
+- 시초가 갭상/갭하가 큰 경우, 처음 5~10분 캔들 방향을 보고 분할 진입 비율을 조정합니다.
+- 장 중 거래량이 전일 대비 급증하면, 익절 구간을 한 단계씩 위로 조정하는 것을 고려합니다.
+- 반대로 거래량이 죽으면서 횡보하면, 손절 라인을 조금 더 타이트하게(예: -2%) 당기고 관망 비중을 높입니다.
+
+※ 위 내용은 공부/연습용 예시 시나리오이며, 실제 매매 판단과 책임은 전적으로 본인에게 있습니다.
+"""
+    return base
+
+
+# -----------------------------
+# Flask 라우트
+# -----------------------------
+@app.route("/")
+def health():
+    return jsonify({"status": "ok", "message": "chang-scalper-api running"})
 
 
 @app.route("/analyze")
 def analyze():
-    raw_symbol = request.args.get("symbol", "").strip()
-    raw_capital = request.args.get("capital", "").strip()
+    symbol_input = request.args.get("symbol", "").strip()
+    capital_raw = request.args.get("capital", "").strip()
 
-    if not raw_symbol:
-        return jsonify({"error": "no_symbol", "message": "심볼을 입력해 주세요."}), 400
+    if not symbol_input:
+        return (
+            jsonify({"error": True, "message": "symbol 파라미터(종목 코드)가 필요합니다."}),
+            400,
+        )
 
-    symbol = build_symbol(raw_symbol)
-    if not symbol:
-        return jsonify(
-            {
-                "error": "invalid_symbol",
-                "message": "코스피/코스닥 6자리 종목 코드를 확인해 주세요.",
-            }
-        ), 400
+    # 한국 종목 코드이면 .KS 붙여서 yfinance 조회
+    symbol_used = symbol_input
+    if symbol_input.isdigit() and len(symbol_input) == 6:
+        # 기본은 코스피(.KS)로 처리. 필요하면 .KQ로 변경 가능.
+        symbol_used = symbol_input + ".KS"
 
-    capital_value = parse_capital(raw_capital)
-
+    # 데이터 다운로드
     try:
-        data = fetch_ohlcv_naver(symbol, pages=15)
+        end = datetime.today()
+        start = end - timedelta(days=160)
+        df = yf.download(symbol_used, start=start, end=end)
     except Exception as e:
         return (
             jsonify(
                 {
-                    "error": "download_failed",
-                    "message": f"네이버 금융 데이터 조회 실패: {e}",
+                    "error": True,
+                    "message": f"데이터 다운로드 실패: {str(e)}",
+                    "symbol_used": symbol_used,
                 }
             ),
             500,
         )
 
-    if data is None or data.empty:
+    if df is None or df.empty or len(df) < 40:
         return (
             jsonify(
                 {
-                    "error": "empty_data",
-                    "message": f"{symbol} 데이터가 없습니다. (네이버 금융)",
+                    "error": True,
+                    "message": "가격 데이터가 부족합니다. 심볼/종목 코드를 다시 확인해 주세요.",
+                    "symbol_used": symbol_used,
                 }
             ),
-            404,
+            400,
         )
 
-    if len(data) < 20:
-        return jsonify(
-            {
-                "error": "insufficient_data",
-                "message": "20일선 계산에 필요한 데이터가 부족합니다.",
-            }
-        ), 400
+    df = df.rename(columns={"Close": "close", "Volume": "volume"})
+    df["ma5"] = df["close"].rolling(window=5).mean()
+    df["ma20"] = df["close"].rolling(window=20).mean()
+    df["rsi"] = calc_rsi(df["close"])
 
-    closes = data["Close"]
-    volumes = data["Volume"]
+    df = df.dropna()
+    if len(df) < 5:
+        return (
+            jsonify(
+                {
+                    "error": True,
+                    "message": "유효한 지표 계산을 위한 데이터가 부족합니다.",
+                    "symbol_used": symbol_used,
+                }
+            ),
+            400,
+        )
 
-    today_close = float(closes.iloc[-1])
-    ma5 = float(closes.iloc[-5:].mean())
-    ma20 = float(closes.iloc[-20:].mean())
-    vol_today = float(volumes.iloc[-1])
-    vol_prev = float(volumes.iloc[-2])
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    rsi = calc_rsi(closes)
+    today_close = float(last["close"])
+    ma5 = float(last["ma5"])
+    ma20 = float(last["ma20"])
+    rsi = float(last["rsi"])
 
-    score = 0
-    reasons = []
+    volume_today = int(last["volume"])
+    volume_prev = int(prev["volume"]) if prev["volume"] == prev["volume"] else 0  # NaN 방지
 
-    if today_close > ma20:
-        score += 1
-        reasons.append("20일선 위 (안전)")
-    else:
-        reasons.append("20일선 아래 → 위험")
+    stop_loss_price = today_close * 0.97  # -3%
+    tp1_price = today_close * 1.05  # +5%
+    tp2_price = today_close * 1.07  # +7%
 
-    if ma5 > ma20:
-        score += 1
-        reasons.append("5일선이 20일선 상향 돌파")
+    # 시그널 / 이유
+    signal_kor, reasons = build_signal(
+        today_close=today_close,
+        ma20=ma20,
+        rsi=rsi,
+        volume_today=volume_today,
+        volume_prev=volume_prev,
+    )
 
-    if vol_today > vol_prev * 1.5:
-        score += 1
-        reasons.append("거래량 증가 (전일 대비 +50% 이상)")
-    else:
-        reasons.append("거래량 평범 또는 감소")
+    # 전략 텍스트
+    strategy_text = build_strategy_text(
+        signal=signal_kor,
+        today_close=today_close,
+        stop_loss_price=stop_loss_price,
+        tp1_price=tp1_price,
+        tp2_price=tp2_price,
+    )
 
-    if 45 <= rsi <= 60:
-        score += 1
-        reasons.append("RSI 건강 구간 (45~60)")
-    elif rsi > 70:
-        reasons.append("RSI 과열 (70 이상)")
-    elif rsi < 30:
-        reasons.append("RSI 과매도 (30 이하)")
+    # 자본/포지션 사이징
+    capital = parse_capital(capital_raw)
+    position_info = make_position_plan(today_close=today_close, capital=capital)
 
-    if score >= 3:
-        signal = "BUY_STRONG"
-        signal_kor = "🟢 매수 유력"
-    elif score == 2:
-        signal = "WATCH"
-        signal_kor = "🟡 관망"
-    else:
-        signal = "AVOID"
-        signal_kor = "🔴 매수주의"
-
-    stop_loss_price = round(today_close * 0.97)
-    tp1_price = round(today_close * 1.05)
-    tp2_price = round(today_close * 1.07)
-
-    position_budget = None
-    shares_total = None
-    pos1_amount = pos2_amount = pos3_amount = None
-    pos1_shares = pos2_shares = pos3_shares = None
-
-    if capital_value is not None and today_close > 0:
-        risk_fraction = 0.10
-        position_budget = capital_value * risk_fraction
-
-        shares_total = int(position_budget // today_close)
-
-        pos1_shares = int(shares_total * 0.4)
-        pos2_shares = int(shares_total * 0.3)
-        pos3_shares = shares_total - pos1_shares - pos2_shares
-
-        pos1_amount = pos1_shares * today_close
-        pos2_amount = pos2_shares * today_close
-        pos3_amount = pos3_shares * today_close
-
-    strategy_lines = []
-
-    strategy_lines.append("STEP 1. 오늘 이 종목을 볼 가치가 있을까?")
-    if score >= 3:
-        strategy_lines.append(" → 단타 A-세트 기준으로 '오늘 진입 후보'에 해당합니다.")
-    elif score == 2:
-        strategy_lines.append(" → 패턴은 나쁘지 않지만 애매한 구간입니다. '관망 또는 소액 진입'이 적합합니다.")
-    else:
-        strategy_lines.append(" → 추세/거래량/RSI 조건이 충분히 맞지 않아 오늘은 관망이 더 안전합니다.")
-
-    strategy_lines.append("")
-    strategy_lines.append("STEP 2. 오늘의 추세 요약")
-    trend_desc = []
-    if today_close > ma20:
-        trend_desc.append("· 가격이 20일선 위에 있어 중기 추세는 양호합니다.")
-    else:
-        trend_desc.append("· 가격이 20일선 아래에 있어 중기 추세가 약한 편입니다.")
-
-    if ma5 > ma20:
-        trend_desc.append("· 5일선이 20일선 위에 있어 단기 추세도 우상향입니다.")
-    else:
-        trend_desc.append("· 5일선이 20일선 아래에 있어 단기 추세는 아직 약합니다.")
-
-    if vol_today > vol_prev * 1.5:
-        trend_desc.append("· 거래량이 전일 대비 크게 증가해 수급이 유입되는 모습입니다.")
-    else:
-        trend_desc.append("· 거래량이 전일 대비 크지 않아 강한 수급은 아닙니다.")
-
-    if 45 <= rsi <= 60:
-        trend_desc.append("· RSI는 45~60 구간으로, 과열도 과매도도 아닌 '건강한 구간'입니다.")
-    elif rsi > 70:
-        trend_desc.append("· RSI가 과열(70 이상)에 가까워 단기 급등 후 조정 가능성을 염두에 둬야 합니다.")
-    elif rsi < 30:
-        trend_desc.append("· RSI가 과매도(30 이하)에 가까워 단기 반등 가능성은 있으나 추세 확인이 필요합니다.")
-
-    strategy_lines.extend(trend_desc)
-
-    strategy_lines.append("")
-    strategy_lines.append("STEP 3. 오늘의 추천 행동")
-    if score >= 3:
-        strategy_lines.append(" → '진입 가능' 구간입니다. 다만 반드시 분할 매수와 손절 기준을 함께 사용해야 합니다.")
-    elif score == 2:
-        strategy_lines.append(" → '부분 진입 또는 관망'이 적절합니다. 무리한 비중 확대는 피하는 편이 안전합니다.")
-    else:
-        strategy_lines.append(" → 오늘은 신규 매수보다는 관망을 추천합니다.")
-
-    strategy_lines.append("")
-    strategy_lines.append("STEP 4. 매수 타점 (예시)")
-    strategy_lines.append(" · 1차 매수: 현재가 ~ 5일선 근처 가격대에서 분할 진입을 고려합니다.")
-    strategy_lines.append(" · 2차 매수: 1차 매수 후 단기 눌림(-1% 내외)이 나올 경우 추가 진입을 검토합니다.")
-    strategy_lines.append(" · 3차 매수: 추세가 유지되는 선에서 추가 상승 또는 재조정 시 확인 후 진입합니다.")
-
-    strategy_lines.append("")
-    strategy_lines.append("STEP 5. 오늘 이 종목에 쓸 수 있는 최대 금액 (예시 기준)")
-    if capital_value is not None and position_budget is not None and shares_total is not None and shares_total > 0:
-        strategy_lines.append(f" · 입력 자본: 약 {capital_value:,.0f}원")
-        strategy_lines.append(f" · 이 종목에 사용할 최대 금액 (자본의 10% 가정): 약 {position_budget:,.0f}원")
-        strategy_lines.append(f" · 현재가 기준 총 매수 가능 수량: 약 {shares_total:,}주")
-        strategy_lines.append(" · 표준형 분할 매수 (40% / 30% / 30%) 기준:")
-        strategy_lines.append(f"    - 1차: {pos1_shares:,}주 (약 {pos1_amount:,.0f}원)")
-        strategy_lines.append(f"    - 2차: {pos2_shares:,}주 (약 {pos2_amount:,.0f}원)")
-        strategy_lines.append(f"    - 3차: {pos3_shares:,}주 (약 {pos3_amount:,.0f}원)")
-    else:
-        strategy_lines.append(" · 자본 정보를 입력하지 않아 구체적인 금액/수량 계산은 생략되었습니다.")
-        strategy_lines.append(" · 원한다면 화면의 '투자 가능한 총 자본(원)' 입력란에 자본을 입력하고 다시 조회해 주세요.")
-
-    strategy_lines.append("")
-    strategy_lines.append("STEP 6. 손절 기준 (예시)")
-    strategy_lines.append(f" · 손절가: 현재가 대비 약 -3% 구간 (대략 {stop_loss_price:,.0f}원 부근)")
-    strategy_lines.append(" · 손절가는 매수 전에 미리 정해 두고, 도달 시 추가 고민 없이 정리하는 것이 좋습니다.")
-
-    strategy_lines.append("")
-    strategy_lines.append("STEP 7. 익절 기준 (예시)")
-    strategy_lines.append(f" · 1차 익절: 현재가 대비 +5% (대략 {tp1_price:,.0f}원 부근)")
-    strategy_lines.append(f" · 2차 익절: 현재가 대비 +7% (대략 {tp2_price:,.0f}원 부근)")
-    strategy_lines.append(" · 수익이 났을 때 일부라도 확정해 두는 습관이 심리적으로 안정에 도움이 됩니다.")
-
-    strategy_lines.append("")
-    strategy_lines.append("STEP 8. 보유 중 체크 포인트")
-    strategy_lines.append(" · RSI가 70 이상으로 과열 구간에 진입하면, 일부 익절 또는 비중 축소를 고려합니다.")
-    strategy_lines.append(" · 5일선을 이탈하고 거래량이 증가하며 하락하는 경우, 방어적인 대응이 필요합니다.")
-    strategy_lines.append(" · 20일선까지 깨지는 경우 중기 추세가 훼손될 수 있으므로, 대부분 정리를 검토합니다.")
-
-    strategy_lines.append("")
-    strategy_lines.append("STEP 9. 청산 시나리오")
-    strategy_lines.append(" · 목표 수익(예: +5~7%) 구간에 도달했다면, 욕심을 과도하게 내지 말고 계획대로 청산합니다.")
-    strategy_lines.append(" · 손절 구간에 도달했다면, '다시 오를 것'이라는 희망보다 원래 세운 원칙을 우선합니다.")
-
-    strategy_lines.append("")
-    strategy_lines.append("STEP 10. 복기")
-    strategy_lines.append(" · 매매가 끝난 후, 진입/청산 위치와 오늘의 전략을 다시 비교해 보면서 한 줄 정도의 복기를 남겨 보세요.")
-    strategy_lines.append(" · 시스템은 의사결정을 돕는 도구일 뿐, 최종 판단과 책임은 항상 본인에게 있음을 기억하는 것이 중요합니다.")
-
-    strategy_text = "\n".join(strategy_lines)
-
-    result = {
-        "symbol_input": raw_symbol,
-        "symbol_used": symbol,
-        "today_close": today_close,
-        "ma5": ma5,
-        "ma20": ma20,
-        "volume_today": vol_today,
-        "volume_prev": vol_prev,
-        "rsi": rsi,
-        "score": score,
-        "signal": signal,
+    payload = {
+        "error": False,
+        "symbol_input": symbol_input,
+        "symbol_used": symbol_used,
+        "today_close": round(today_close),
+        "ma5": round(ma5),
+        "ma20": round(ma20),
+        "rsi": round(rsi, 1),
+        "volume_today": int(volume_today),
+        "volume_prev": int(volume_prev),
+        "stop_loss_price": round(stop_loss_price),
+        "tp1_price": round(tp1_price),
+        "tp2_price": round(tp2_price),
         "signal_kor": signal_kor,
         "reasons": reasons,
         "strategy_text": strategy_text,
-        "stop_loss_price": stop_loss_price,
-        "tp1_price": tp1_price,
-        "tp2_price": tp2_price,
-        "capital_input": capital_value,
-        "position_budget": position_budget,
-        "shares_total": shares_total,
-        "pos1_shares": pos1_shares,
-        "pos2_shares": pos2_shares,
-        "pos3_shares": pos3_shares,
-        "pos1_amount": pos1_amount,
-        "pos2_amount": pos2_amount,
-        "pos3_amount": pos3_amount,
+        **position_info,
     }
 
-    return jsonify(result)
-
-
-@app.route("/")
-def health():
-    return "Chang scalper API (Naver + bs4 + CORS) is running."
+    return jsonify(payload)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Render에서 PORT 환경변수를 사용하므로 이렇게 설정
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
